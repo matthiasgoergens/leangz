@@ -1,0 +1,27 @@
+[package]
+name = "leangz-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+leangz = { path = "..", default-features = false }
+afl = { version = "0.15", optional = true }
+zerocopy = "0.8"
+
+[features]
+afl = ["dep:afl"]
+
+[[bin]]
+name = "roundtrip"
+required-features = ["afl"]
+
+[[bin]]
+name = "decompress"
+required-features = ["afl"]
+
+[[bin]]
+name = "replay"
+
+# not part of the leangz workspace
+[workspace]
