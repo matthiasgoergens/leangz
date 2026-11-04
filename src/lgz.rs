@@ -1518,7 +1518,7 @@ const TOO_LARGE: &str = "larger than the size in the header";
 /// Appends `n` bytes read from `r` to `buf`, which grows only as the bytes
 /// arrive, so that a length in corrupt input cannot make it allocate much
 /// more memory than the input fills.
-fn read_into(r: &mut impl Read, buf: &mut Vec<u8>, mut n: usize) -> std::io::Result<()> {
+pub(crate) fn read_into(r: &mut impl Read, buf: &mut Vec<u8>, mut n: usize) -> std::io::Result<()> {
   while n != 0 {
     let chunk = n.min(1 << 16);
     let start = buf.len();
