@@ -1538,6 +1538,15 @@ enum LgzVersion {
 /// Decompresses an lgz stream of `n` .olean files (3 for a module with its
 /// .server and .private parts) and returns them, laid out one after the other
 /// as Lean maps them, with the range of each.
+///
+/// The input may be anything: this returns an error rather than panicking,
+/// and it ends on any input.  Each step of `LgzDecompressor::write_obj` reads
+/// at least one byte or completes an object that an earlier step started by
+/// reading one, and recomputing a hash looks at a bounded number of objects,
+/// except for the level list of a constant, which `get_list_level_data`
+/// follows only towards objects written earlier, so that it ends too.  (The
+/// decompressor cannot build a cycle anyway: an object can refer only to
+/// objects already complete.)
 pub fn decompress(
   mut infile: impl Read, mut n: usize,
 ) -> Result<(Vec<u8>, Vec<Range<usize>>), DecompressError> {

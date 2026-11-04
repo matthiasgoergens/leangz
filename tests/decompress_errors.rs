@@ -16,10 +16,12 @@ const UINT0: u8 = 0xd0;
 const INT4: u8 = 0xfa;
 const INT8: u8 = 0xfb;
 const BACKREF0: u8 = 0xf0;
+const SAVE: u8 = 0xff;
 const EXPRISH_NORMAL: u8 = 0x20;
 const EXPRISH_NAME_STR: u8 = 0x00;
 const EXPRISH_EXPR_BVAR: u8 = 0x07;
 const EXPRISH_EXPR_APP: u8 = 0x20;
+const EXPRISH_CONST_APP: u8 = 0x40;
 /// Object bases are multiples of 64 KiB.
 const BASE: u64 = 1 << 16;
 const TAG_MPZ: u8 = 250;
@@ -218,4 +220,35 @@ fn test_corrupted() {
       }
     }
   }
+}
+
+/// A constant whose level list has the shape of `some x`, a tag 1
+/// constructor with one field, on which reading the levels did not advance.
+#[test]
+fn test_level_list_of_one_field() {
+  let const_app = [EXPRISH, EXPRISH_CONST_APP, UINT0, 0x12, UINT0];
+  assert!(decompress(Cursor::new(&stream(1 << 10, &const_app)), 1).is_ok());
+}
+
+/// A level list whose tail would be the list itself: a backref refers only
+/// to an object already complete, so the stream cannot build the cycle.
+#[test]
+fn test_cyclic_level_list() {
+  // `SAVE` `List.cons Level.zero <backref 0>` as the levels of a constant
+  let const_app = [EXPRISH, EXPRISH_CONST_APP, UINT0, SAVE, 0x14, UINT0, BACKREF0];
+  assert_eq!(invalid(&stream(1 << 10, &const_app)), "backref out of range");
+}
+
+/// Objects nested a million deep, which the decompressor keeps on the heap
+/// rather than on the 2 MiB stack of a test thread.
+#[test]
+fn test_deep_nesting() {
+  const THUNK: u8 = 0x50;
+  let depth = 1_000_000;
+  let thunks = [vec![THUNK; depth], vec![UINT0]].concat();
+  assert!(decompress(Cursor::new(&stream(1 << 30, &thunks)), 1).is_ok());
+  ends_early(&stream(1 << 30, &thunks[..depth]));
+  // switching between normal and exprish mode, which reads no object
+  let switches = [[EXPRISH, EXPRISH_NORMAL].repeat(depth), vec![UINT0]].concat();
+  assert!(decompress(Cursor::new(&stream(1 << 10, &switches)), 1).is_ok());
 }
