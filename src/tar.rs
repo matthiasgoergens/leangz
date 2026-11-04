@@ -229,14 +229,17 @@ fn main() {
         e => BufReader::new(e.unwrap()),
       };
       if let Err(e) = ltar::unpack(&basedirs, tarfile, force, hash, verbose) {
-        if matches!(&e, UnpackError::IOError(e)
-          if matches!(e.kind(), io::ErrorKind::UnexpectedEof))
-        {
+        let corrupted = match &e {
+          UnpackError::IOError(e) => e.kind() == io::ErrorKind::UnexpectedEof,
+          UnpackError::Lgz(_) => true,
+          _ => false,
+        };
+        if corrupted {
           if delete_corrupted {
-            eprintln!("{file}: removing corrupted file");
+            eprintln!("{file}: removing corrupted file ({e})");
             let _ = std::fs::remove_file(file);
           } else {
-            eprintln!("{file}: file is corrupted, try deleting or redownloading it");
+            eprintln!("{file}: file is corrupted ({e}), try deleting or redownloading it");
             fail()
           }
         } else {

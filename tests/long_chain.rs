@@ -109,7 +109,7 @@ impl OleanBuilder {
 fn roundtrip(olean: &[u8]) -> usize {
   let mut lgz = vec![];
   leangz::lgz::compress(&[olean], &mut lgz);
-  let (buf, ranges) = leangz::lgz::decompress(Cursor::new(&lgz), 1);
+  let (buf, ranges) = leangz::lgz::decompress(Cursor::new(&lgz), 1).unwrap();
   assert_eq!(ranges.len(), 1);
   assert!(buf[ranges[0].clone()] == *olean, "round trip differs");
   lgz.len()

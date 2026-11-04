@@ -1472,25 +1472,67 @@ impl<W: Write> LgzWriter<'_, W> {
   }
 }
 
+/// Why `decompress` failed.
+#[derive(Debug)]
+pub enum DecompressError {
+  /// Reading the input failed, or it ended early.
+  Io(std::io::Error),
+  /// The input is not an lgz stream that `compress` writes.
+  Invalid(&'static str),
+}
+
+impl std::fmt::Display for DecompressError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      DecompressError::Io(e) => e.fmt(f),
+      DecompressError::Invalid(what) => write!(f, "invalid lgz data: {what}"),
+    }
+  }
+}
+
+impl std::error::Error for DecompressError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      DecompressError::Io(e) => Some(e),
+      DecompressError::Invalid(_) => None,
+    }
+  }
+}
+
+impl From<std::io::Error> for DecompressError {
+  fn from(e: std::io::Error) -> Self { DecompressError::Io(e) }
+}
+
+/// The value in `x`, which a valid input provides.
+fn need<T>(x: Option<T>, what: &'static str) -> Result<T, DecompressError> {
+  x.ok_or(DecompressError::Invalid(what))
+}
+
 enum LgzVersion {
   V0,
   V1,
   V2,
 }
 
-pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<usize>>) {
+/// Decompresses an lgz stream of `n` .olean files (3 for a module with its
+/// .server and .private parts) and returns them, laid out one after the other
+/// as Lean maps them, with the range of each.
+pub fn decompress(
+  mut infile: impl Read, mut n: usize,
+) -> Result<(Vec<u8>, Vec<Range<usize>>), DecompressError> {
+  assert!(n != 0, "decompress needs at least one file");
   let mut magic = [0u8; 4];
-  infile.read_exact(&mut magic).unwrap();
+  infile.read_exact(&mut magic)?;
   let version = match magic {
     MAGIC2 => LgzVersion::V2,
     MAGIC1 => LgzVersion::V1,
     MAGIC0 => LgzVersion::V0,
-    _ => panic!("unrecognized LGZ version"),
+    _ => return Err(DecompressError::Invalid("unrecognized LGZ version")),
   };
-  let base = (infile.read_u32::<LE>().unwrap() as u64) << 16;
+  let base = (infile.read_u32::<LE>()? as u64) << 16;
   let mut w = LgzDecompressor {
     cfg: Config { use_gmp: use_gmp(false) },
-    buf: Vec::with_capacity(infile.read_u64::<LE>().unwrap() as usize),
+    buf: Vec::with_capacity(infile.read_u64::<LE>()? as usize),
     file: WithPosition { r: infile, pos: 8 },
     offset: base,
     // depth: 0,
@@ -1505,7 +1547,7 @@ pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<us
       w.buf.extend_from_slice(b"olean");
       w.buf.push(1);
       let mut githash_in = [0; 40];
-      w.file.read_exact(&mut githash_in).unwrap();
+      w.file.read_exact(&mut githash_in)?;
       if mac_v1_use_gmp(&githash_in) {
         w.cfg.use_gmp = use_gmp(true)
       }
@@ -1516,18 +1558,18 @@ pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<us
       w.buf.extend_from_slice(b"olean");
       w.buf.push(2);
       let mut githash_in = [0; 40];
-      w.file.read_exact(&mut githash_in).unwrap();
-      let flags = w.file.read_u8().unwrap();
+      w.file.read_exact(&mut githash_in)?;
+      let flags = w.file.read_u8()?;
       w.cfg.use_gmp = flags & 1 != 0;
       w.buf.push(w.cfg.use_gmp as u8);
       let mut lean_version_in = [0; 33];
-      let major = w.file.read_u8().unwrap();
+      let major = w.file.read_u8()?;
       if major == 0 {
-        w.file.read_exact(&mut lean_version_in).unwrap();
+        w.file.read_exact(&mut lean_version_in)?;
       } else {
-        let minor = w.file.read_u8().unwrap();
-        let patch = w.file.read_u8().unwrap();
-        let rc_m1 = w.file.read_u8().unwrap();
+        let minor = w.file.read_u8()?;
+        let patch = w.file.read_u8()?;
+        let rc_m1 = w.file.read_u8()?;
         let lean_version = LeanVersion::encode(major, minor, patch, rc_m1);
         lean_version_in[..lean_version.len()].copy_from_slice(lean_version.as_bytes());
       }
@@ -1543,7 +1585,7 @@ pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<us
   let mut ranges = vec![];
   let mut extra = 0;
   loop {
-    let root = w.write_obj();
+    let root = w.write_obj()?;
     LE::write_u64(&mut w.buf[(extra + fixup_pos)..], root);
     ranges.push(extra..w.buf.len());
     n -= 1;
@@ -1555,7 +1597,7 @@ pub fn decompress(mut infile: impl Read, mut n: usize) -> (Vec<u8>, Vec<Range<us
     w.buf.extend_from_within(0..header_size);
     LE::write_u64(&mut w.buf[(extra + base_pos)..], base + extra as u64);
   }
-  (w.buf, ranges)
+  Ok((w.buf, ranges))
 }
 
 pub struct WithPosition<R> {
@@ -1654,11 +1696,12 @@ impl<R: Read> LgzDecompressor<R> {
     pos
   }
 
-  fn copy(&mut self, size: usize, size_padded: usize) {
+  fn copy(&mut self, size: usize, size_padded: usize) -> Result<(), DecompressError> {
     self.temp.resize(size, 0);
-    self.file.read_exact(&mut self.temp).unwrap();
+    self.file.read_exact(&mut self.temp)?;
     self.temp.resize(size_padded, 0);
     self.buf.write_all(&self.temp).unwrap();
+    Ok(())
   }
 
   fn pop(&mut self, start: usize) {
@@ -1679,25 +1722,27 @@ impl<R: Read> LgzDecompressor<R> {
     self.stack.truncate(start);
   }
 
-  fn read_i64(&mut self, tag: u8) -> i64 {
-    match tag {
+  fn read_i64(&mut self, tag: u8) -> Result<i64, DecompressError> {
+    Ok(match tag {
       UINT0..=UINT0_END => (tag - UINT0).into(),
-      INT1 => self.file.read_i8().unwrap().into(),
-      INT2 => self.file.read_i16::<LE>().unwrap().into(),
-      INT4 => self.file.read_i32::<LE>().unwrap().into(),
-      INT8 => self.file.read_i64::<LE>().unwrap(),
-      _ => panic!("unexpected int"),
-    }
+      INT1 => self.file.read_i8()?.into(),
+      INT2 => self.file.read_i16::<LE>()?.into(),
+      INT4 => self.file.read_i32::<LE>()?.into(),
+      INT8 => self.file.read_i64::<LE>()?,
+      _ => return Err(DecompressError::Invalid("expected an integer")),
+    })
   }
 
-  fn read_backref(&mut self, tag: u8) -> u32 {
-    match tag {
+  /// Reads the backref that `tag` starts and returns the object it refers to.
+  fn read_backref(&mut self, tag: u8) -> Result<u64, DecompressError> {
+    let r = match tag {
       BACKREF0..=BACKREF0_END => (tag - BACKREF0).into(),
-      BACKREF1 => self.file.read_u8().unwrap().into(),
-      BACKREF2 => self.file.read_u16::<LE>().unwrap().into(),
-      BACKREF4 => self.file.read_u32::<LE>().unwrap(),
-      _ => panic!("unexpected backref"),
-    }
+      BACKREF1 => self.file.read_u8()?.into(),
+      BACKREF2 => self.file.read_u16::<LE>()?.into(),
+      BACKREF4 => self.file.read_u32::<LE>()?,
+      _ => unreachable!(),
+    };
+    need(self.backrefs.get(r as usize).copied(), "backref out of range")
   }
 
   fn write_u32(&mut self, n: u32) { self.buf.write_u32::<LE>(n).unwrap(); }
@@ -1709,19 +1754,21 @@ impl<R: Read> LgzDecompressor<R> {
   }
 
   /// Writes the constructor, whose fields are on the stack from `start`.
-  fn write_ctor(&mut self, ctor: u8, num_fields: u8, sfields: u16, start: usize) -> u64 {
+  fn write_ctor(
+    &mut self, ctor: u8, num_fields: u8, sfields: u16, start: usize,
+  ) -> Result<u64, DecompressError> {
     let pos = self.write_ctor_header(ctor, num_fields, sfields);
     self.pop(start);
     let size = (sfields << 3) as usize;
-    self.copy(size, size);
-    pos
+    self.copy(size, size)?;
+    Ok(pos)
   }
 
-  fn write_str(&mut self) -> u64 {
+  fn write_str(&mut self) -> Result<u64, DecompressError> {
     self.temp.clear();
     let mut len = 0;
     loop {
-      let c = self.file.read_u8().unwrap();
+      let c = self.file.read_u8()?;
       self.temp.push(c);
       if c == 0 {
         break
@@ -1730,17 +1777,20 @@ impl<R: Read> LgzDecompressor<R> {
         len += 1;
       }
     }
-    self.write_str_obj(len)
+    Ok(self.write_str_obj(len))
   }
 
-  fn write_sized_str(&mut self) -> u64 {
-    let tag = self.file.read_u8().unwrap();
-    let size = self.read_i64(tag) as usize;
-    self.temp.resize(size, 0);
-    self.file.read_exact(&mut self.temp).unwrap();
+  fn write_sized_str(&mut self) -> Result<u64, DecompressError> {
+    let tag = self.file.read_u8()?;
+    let size = self.read_i64(tag)? as u64;
+    self.temp.clear();
+    (&mut self.file).take(size).read_to_end(&mut self.temp)?;
+    if self.temp.len() as u64 != size {
+      return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+    }
     let len = self.temp.iter().filter(|&&c| c & 0xC0 != 0x80).count();
     self.temp.push(0);
-    self.write_str_obj(len as u64)
+    Ok(self.write_str_obj(len as u64))
   }
 
   /// Writes a string object of `len` characters whose bytes, including the
@@ -1767,13 +1817,13 @@ impl<R: Read> LgzDecompressor<R> {
 
   /// Reads an object and writes it with everything it points to, returning
   /// the pointer to it (or the boxed scalar).
-  fn write_obj(&mut self) -> u64 {
+  fn write_obj(&mut self) -> Result<u64, DecompressError> {
     debug_assert!(self.frames.is_empty());
     let mut mode = LgzMode::Normal;
     loop {
       let step = match mode {
-        LgzMode::Normal => self.start_obj(),
-        LgzMode::Exprish => self.start_exprish(),
+        LgzMode::Normal => self.start_obj()?,
+        LgzMode::Exprish => self.start_exprish()?,
       };
       let mut value = match step {
         Step::Read(next) => {
@@ -1786,14 +1836,14 @@ impl<R: Read> LgzDecompressor<R> {
       // for each object that this completes
       mode = loop {
         match self.frames.last() {
-          None => return value,
+          None => return Ok(value),
           Some(&Frame::Save) => self.backrefs.push(value),
           Some(&Frame::Ctor { ctor, num_fields, sfields, start }) => {
             self.stack.push(value.into());
             if self.stack.len() - start < num_fields.into() {
               break LgzMode::Normal
             }
-            value = self.write_ctor(ctor, num_fields, sfields, start);
+            value = self.write_ctor(ctor, num_fields, sfields, start)?;
           }
           Some(&Frame::Array { size, start }) => {
             self.stack.push(value.into());
@@ -1809,7 +1859,7 @@ impl<R: Read> LgzDecompressor<R> {
               break mode
             }
             self.frames.pop();
-            match self.write_exprish(tag, start) {
+            match self.write_exprish(tag, start)? {
               Step::Read(mode) => break mode,
               Step::Done(pos) => {
                 value = pos;
@@ -1818,7 +1868,7 @@ impl<R: Read> LgzDecompressor<R> {
             }
           }
           Some(&Frame::App { pos, data, n }) => {
-            let (pos, data) = self.write_app(pos, data, value);
+            let (pos, data) = self.write_app(pos, data, value)?;
             if n > 1 {
               *self.frames.last_mut().unwrap() = Frame::App { pos, data, n: n - 1 };
               break LgzMode::Exprish
@@ -1856,9 +1906,9 @@ impl<R: Read> LgzDecompressor<R> {
 
   /// Writes the application of `pos`, whose expression data is `data`, to
   /// `ptr2`, and returns the pointer to it and its expression data.
-  fn write_app(&mut self, pos: u64, data: u64, ptr2: u64) -> (u64, u64) {
+  fn write_app(&mut self, pos: u64, data: u64, ptr2: u64) -> Result<(u64, u64), DecompressError> {
     let pos2 = self.write_ctor_header(5, 2, 1);
-    let data2 = get_expr_data(&self.buf, self.offset, ptr2).unwrap();
+    let data2 = need(get_expr_data(&self.buf, self.offset, ptr2), "expected an expression")?;
     let data = exprish::expr_app_data(data, data2);
     // println!(
     //   "{:d$}{:x}: app[{d}]({:x}) {:x?}",
@@ -1874,7 +1924,7 @@ impl<R: Read> LgzDecompressor<R> {
     self.write_u64(pos);
     self.write_u64(ptr2);
     self.write_u64(data);
-    (pos2, data)
+    Ok((pos2, data))
   }
 
   /// Applies `pos`, whose expression data is `data`, to the next `n`
@@ -1888,18 +1938,20 @@ impl<R: Read> LgzDecompressor<R> {
   }
 
   /// Starts reading the `num_fields` fields of a constructor.
-  fn start_ctor(&mut self, ctor: u8, num_fields: u8, sfields: u16) -> Step {
+  fn start_ctor(
+    &mut self, ctor: u8, num_fields: u8, sfields: u16,
+  ) -> Result<Step, DecompressError> {
     let start = self.stack.len();
     if num_fields == 0 {
-      return Step::Done(self.write_ctor(ctor, num_fields, sfields, start))
+      return Ok(Step::Done(self.write_ctor(ctor, num_fields, sfields, start)?))
     }
     self.frames.push(Frame::Ctor { ctor, num_fields, sfields, start });
-    Step::Read(LgzMode::Normal)
+    Ok(Step::Read(LgzMode::Normal))
   }
 
-  fn start_exprish(&mut self) -> Step {
+  fn start_exprish(&mut self) -> Result<Step, DecompressError> {
     use LgzMode::{Exprish as E, Normal as N};
-    let tag = self.file.read_u8().unwrap();
+    let tag = self.file.read_u8()?;
     // let start = self.buf.len();
     // println!(
     //   "{:d$}{start:x}: write_exprish[{d}]({:x}) {tag:x}",
@@ -1909,7 +1961,7 @@ impl<R: Read> LgzDecompressor<R> {
     // );
     #[allow(clippy::match_overlapping_arm)]
     let modes: &'static [LgzMode] = match tag {
-      exprish::NORMAL => return Step::Read(N),
+      exprish::NORMAL => return Ok(Step::Read(N)),
       exprish::NAME_STR | exprish::NAME_NUM => &[E, N],
       exprish::LEVEL_SUCC | exprish::LEVEL_PARAM | exprish::LEVEL_MVAR => &[E],
       exprish::LEVEL_MAX | exprish::LEVEL_IMAX => &[E, E],
@@ -1919,28 +1971,26 @@ impl<R: Read> LgzDecompressor<R> {
       exprish::EXPR_PROJ => &[E, N, E],
       exprish::EXPR_LET..=exprish::EXPR_LET_END => &[E, E, E, E],
       exprish::EXPR_LAMBDA..=exprish::EXPR_FORALL_END => &[E, E, E],
-      ..=exprish::EXPR_APP => unreachable!(),
+      ..=exprish::EXPR_APP => return Err(DecompressError::Invalid("unknown exprish opcode")),
       ..=exprish::EXPR_APP_END => &[E],
       exprish::EXPR_CONST_APP..=exprish::EXPR_CONST_APP_END => &[E, N],
       UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8 =>
-        return Step::Done(((self.read_i64(tag) << 1) | 1) as u64),
+        return Ok(Step::Done(((self.read_i64(tag)? << 1) | 1) as u64)),
       SAVE => {
         self.frames.push(Frame::Save);
-        return Step::Read(E)
+        return Ok(Step::Read(E))
       }
-      BACKREF0..=BACKREF0_END | BACKREF1 | BACKREF2 | BACKREF4 => {
-        let r = self.read_backref(tag);
-        return Step::Done(self.backrefs[r as usize])
-      }
-      _ => unreachable!(),
+      BACKREF0..=BACKREF0_END | BACKREF1 | BACKREF2 | BACKREF4 =>
+        return Ok(Step::Done(self.read_backref(tag)?)),
+      _ => return Err(DecompressError::Invalid("unknown exprish opcode")),
     };
     self.frames.push(Frame::Exprish { tag, modes, start: self.stack.len() });
-    Step::Read(modes[0])
+    Ok(Step::Read(modes[0]))
   }
 
   /// Writes the exprish object `tag`, whose fields are on the stack from
   /// `start`.
-  fn write_exprish(&mut self, tag: u8, start: usize) -> Step {
+  fn write_exprish(&mut self, tag: u8, start: usize) -> Result<Step, DecompressError> {
     #[allow(clippy::match_overlapping_arm)]
     let pos = match tag {
       exprish::NAME_STR => {
@@ -1949,8 +1999,8 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ptr1);
         self.write_u64(ptr2);
         self.write_u64(mix_hash(
-          get_name_hash(&self.buf, self.offset, ptr1).unwrap(),
-          get_str_hash(&self.buf, self.offset, ptr2).unwrap(),
+          need(get_name_hash(&self.buf, self.offset, ptr1), "expected a name")?,
+          need(get_str_hash(&self.buf, self.offset, ptr2), "expected a string")?,
         ));
         pos
       }
@@ -1960,7 +2010,7 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ptr1);
         self.write_u64(ptr2);
         self.write_u64(mix_hash(
-          get_name_hash(&self.buf, self.offset, ptr1).unwrap(),
+          need(get_name_hash(&self.buf, self.offset, ptr1), "expected a name")?,
           if ptr2 & 1 == 1 { ptr2 >> 1 } else { 17 },
         ));
         pos
@@ -1970,9 +2020,10 @@ impl<R: Read> LgzDecompressor<R> {
         let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(1, 1, 1);
         self.write_u64(ptr);
-        self.write_u64(exprish::level_succ_data(
-          get_level_data(&self.buf, self.offset, ptr).unwrap(),
-        ));
+        self.write_u64(exprish::level_succ_data(need(
+          get_level_data(&self.buf, self.offset, ptr),
+          "expected a level",
+        )?));
         pos
       }
       exprish::LEVEL_MAX => {
@@ -1981,8 +2032,8 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ptr1);
         self.write_u64(ptr2);
         self.write_u64(exprish::level_max_data(
-          get_level_data(&self.buf, self.offset, ptr1).unwrap(),
-          get_level_data(&self.buf, self.offset, ptr2).unwrap(),
+          need(get_level_data(&self.buf, self.offset, ptr1), "expected a level")?,
+          need(get_level_data(&self.buf, self.offset, ptr2), "expected a level")?,
         ));
         pos
       }
@@ -1992,8 +2043,8 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ptr1);
         self.write_u64(ptr2);
         self.write_u64(exprish::level_imax_data(
-          get_level_data(&self.buf, self.offset, ptr1).unwrap(),
-          get_level_data(&self.buf, self.offset, ptr2).unwrap(),
+          need(get_level_data(&self.buf, self.offset, ptr1), "expected a level")?,
+          need(get_level_data(&self.buf, self.offset, ptr2), "expected a level")?,
         ));
         pos
       }
@@ -2001,17 +2052,20 @@ impl<R: Read> LgzDecompressor<R> {
         let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(4, 1, 1);
         self.write_u64(ptr);
-        self.write_u64(exprish::level_param_data(
-          get_name_hash(&self.buf, self.offset, ptr).unwrap(),
-        ));
+        self.write_u64(exprish::level_param_data(need(
+          get_name_hash(&self.buf, self.offset, ptr),
+          "expected a name",
+        )?));
         pos
       }
       exprish::LEVEL_MVAR => {
         let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(5, 1, 1);
         self.write_u64(ptr);
-        self
-          .write_u64(exprish::level_mvar_data(get_name_hash(&self.buf, self.offset, ptr).unwrap()));
+        self.write_u64(exprish::level_mvar_data(need(
+          get_name_hash(&self.buf, self.offset, ptr),
+          "expected a name",
+        )?));
         pos
       }
 
@@ -2019,42 +2073,50 @@ impl<R: Read> LgzDecompressor<R> {
         let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(0, 1, 1);
         self.write_u64(ptr);
-        self.write_u64(exprish::expr_bvar_data(
-          get_num_hash(self.cfg, &self.buf, self.offset, ptr).unwrap(),
-        ));
+        self.write_u64(exprish::expr_bvar_data(need(
+          get_num_hash(self.cfg, &self.buf, self.offset, ptr),
+          "expected a number",
+        )?));
         pos
       }
       exprish::EXPR_FVAR => {
         let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(1, 1, 1);
         self.write_u64(ptr);
-        self
-          .write_u64(exprish::expr_fvar_data(get_name_hash(&self.buf, self.offset, ptr).unwrap()));
+        self.write_u64(exprish::expr_fvar_data(need(
+          get_name_hash(&self.buf, self.offset, ptr),
+          "expected a name",
+        )?));
         pos
       }
       exprish::EXPR_MVAR => {
         let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(2, 1, 1);
         self.write_u64(ptr);
-        self
-          .write_u64(exprish::expr_mvar_data(get_name_hash(&self.buf, self.offset, ptr).unwrap()));
+        self.write_u64(exprish::expr_mvar_data(need(
+          get_name_hash(&self.buf, self.offset, ptr),
+          "expected a name",
+        )?));
         pos
       }
       exprish::EXPR_SORT => {
         let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(3, 1, 1);
         self.write_u64(ptr);
-        self
-          .write_u64(exprish::expr_sort_data(get_level_data(&self.buf, self.offset, ptr).unwrap()));
+        self.write_u64(exprish::expr_sort_data(need(
+          get_level_data(&self.buf, self.offset, ptr),
+          "expected a level",
+        )?));
         pos
       }
       exprish::EXPR_LIT => {
         let [ptr] = self.take_fields(start);
         let pos = self.write_ctor_header(9, 1, 1);
         self.write_u64(ptr);
-        self.write_u64(exprish::expr_lit_data(
-          get_lit_hash(self.cfg, &self.buf, self.offset, ptr).unwrap(),
-        ));
+        self.write_u64(exprish::expr_lit_data(need(
+          get_lit_hash(self.cfg, &self.buf, self.offset, ptr),
+          "expected a literal",
+        )?));
         pos
       }
       exprish::EXPR_MDATA => {
@@ -2062,9 +2124,10 @@ impl<R: Read> LgzDecompressor<R> {
         let pos = self.write_ctor_header(10, 2, 1);
         self.write_u64(ptr1);
         self.write_u64(ptr2);
-        self.write_u64(exprish::expr_mdata_data(
-          get_expr_data(&self.buf, self.offset, ptr2).unwrap(),
-        ));
+        self.write_u64(exprish::expr_mdata_data(need(
+          get_expr_data(&self.buf, self.offset, ptr2),
+          "expected an expression",
+        )?));
         pos
       }
       exprish::EXPR_PROJ => {
@@ -2074,9 +2137,9 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ptr2);
         self.write_u64(ptr3);
         self.write_u64(exprish::expr_proj_data(
-          get_name_hash(&self.buf, self.offset, ptr1).unwrap(),
-          get_num_hash(self.cfg, &self.buf, self.offset, ptr2).unwrap(),
-          get_expr_data(&self.buf, self.offset, ptr3).unwrap(),
+          need(get_name_hash(&self.buf, self.offset, ptr1), "expected a name")?,
+          need(get_num_hash(self.cfg, &self.buf, self.offset, ptr2), "expected a number")?,
+          need(get_expr_data(&self.buf, self.offset, ptr3), "expected an expression")?,
         ));
         pos
       }
@@ -2088,9 +2151,9 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(value);
         self.write_u64(body);
         self.write_u64(exprish::expr_let_data(
-          get_expr_data(&self.buf, self.offset, ty).unwrap(),
-          get_expr_data(&self.buf, self.offset, value).unwrap(),
-          get_expr_data(&self.buf, self.offset, body).unwrap(),
+          need(get_expr_data(&self.buf, self.offset, ty), "expected an expression")?,
+          need(get_expr_data(&self.buf, self.offset, value), "expected an expression")?,
+          need(get_expr_data(&self.buf, self.offset, body), "expected an expression")?,
         ));
         self.write_u64((tag & 1) as u64);
         pos
@@ -2102,35 +2165,35 @@ impl<R: Read> LgzDecompressor<R> {
         self.write_u64(ty);
         self.write_u64(body);
         self.write_u64(exprish::expr_binder_data(
-          get_expr_data(&self.buf, self.offset, ty).unwrap(),
-          get_expr_data(&self.buf, self.offset, body).unwrap(),
+          need(get_expr_data(&self.buf, self.offset, ty), "expected an expression")?,
+          need(get_expr_data(&self.buf, self.offset, body), "expected an expression")?,
         ));
         self.write_u64((tag & 3) as u64);
         pos
       }
       ..=exprish::EXPR_APP_END => {
         let [ptr] = self.take_fields(start);
-        let data = get_expr_data(&self.buf, self.offset, ptr).unwrap();
-        return self.apply(ptr, data, tag & 0x1f)
+        let data = need(get_expr_data(&self.buf, self.offset, ptr), "expected an expression")?;
+        return Ok(self.apply(ptr, data, tag & 0x1f))
       }
       exprish::EXPR_CONST_APP..=exprish::EXPR_CONST_APP_END => {
         let [ptr1, ptr2] = self.take_fields(start);
-        let hash1 = get_name_hash(&self.buf, self.offset, ptr1).unwrap();
+        let hash1 = need(get_name_hash(&self.buf, self.offset, ptr1), "expected a name")?;
         let (hash2, bits2) = get_list_level_data(&self.buf, self.offset, ptr2);
         let data = exprish::expr_const_data(hash1, hash2, bits2);
         let pos = self.write_ctor_header(4, 2, 1);
         self.write_u64(ptr1);
         self.write_u64(ptr2);
         self.write_u64(data);
-        return self.apply(pos, data, tag & 0x1f)
+        return Ok(self.apply(pos, data, tag & 0x1f))
       }
       _ => unreachable!(),
     };
-    Step::Done(pos)
+    Ok(Step::Done(pos))
   }
 
-  fn start_obj(&mut self) -> Step {
-    let tag = self.file.read_u8().unwrap();
+  fn start_obj(&mut self) -> Result<Step, DecompressError> {
+    let tag = self.file.read_u8()?;
     // let start = self.buf.len();
     // println!(
     //   "{:d$}{start:x}: write_obj[{d}]({:x}) {tag:x} = {:?}, {:?}",
@@ -2143,57 +2206,67 @@ impl<R: Read> LgzDecompressor<R> {
     let pos;
     match tag {
       BIG_CTOR => {
-        let ctor = self.file.read_u8().unwrap();
-        let num_fields = self.file.read_u8().unwrap();
-        let sfields = self.file.read_u16::<LE>().unwrap();
+        let ctor = self.file.read_u8()?;
+        let num_fields = self.file.read_u8()?;
+        let sfields = self.file.read_u16::<LE>()?;
+        if ctor >= tag::PROMISE {
+          // the object tags from here on are not constructors
+          return Err(DecompressError::Invalid("constructor tag out of range"))
+        }
+        if (num_fields as usize + 1 + sfields as usize) << 3 > u16::MAX as usize {
+          // the object header holds the size in a `u16`
+          return Err(DecompressError::Invalid("constructor too large"))
+        }
         return self.start_ctor(ctor, num_fields, sfields)
       }
       SAVE => {
         self.frames.push(Frame::Save);
-        return Step::Read(LgzMode::Normal)
+        return Ok(Step::Read(LgzMode::Normal))
       }
-      tag @ (BACKREF0..=BACKREF0_END | BACKREF1 | BACKREF2 | BACKREF4) => {
-        let r = self.read_backref(tag);
-        pos = self.backrefs[r as usize]
-      }
+      tag @ (BACKREF0..=BACKREF0_END | BACKREF1 | BACKREF2 | BACKREF4) =>
+        pos = self.read_backref(tag)?,
       ARRAY => {
-        let tag = self.file.read_u8().unwrap();
-        let size = self.read_i64(tag) as u64;
+        let tag = self.file.read_u8()?;
+        let size = self.read_i64(tag)? as u64;
         let start = self.stack.len();
         if size == 0 {
           pos = self.write_array(size, start)
         } else {
           self.frames.push(Frame::Array { size, start });
-          return Step::Read(LgzMode::Normal)
+          return Ok(Step::Read(LgzMode::Normal))
         }
       }
       BYTE_ARRAY | SCALAR_ARRAY => {
-        let elem_size = if tag == BYTE_ARRAY { 1 } else { self.file.read_u8().unwrap() };
-        let tag = self.file.read_u8().unwrap();
-        let size = self.read_i64(tag) as u64;
+        let elem_size = if tag == BYTE_ARRAY { 1 } else { self.file.read_u8()? };
+        let tag = self.file.read_u8()?;
+        let size = self.read_i64(tag)? as u64;
+        let bytes =
+          need((elem_size as usize).checked_mul(size as usize), "scalar array too large")?;
+        let size2 = need(bytes.checked_next_multiple_of(8), "scalar array too large")?;
         pos = self.write_header(tag::SCALAR_ARRAY, 1, elem_size);
         self.write_u64(size);
         self.write_u64(size);
-        let bytes = elem_size as usize * size as usize;
-        let (_, size2) = pad_to(bytes, 8);
-        self.copy(bytes, size2);
+        self.copy(bytes, size2)?;
       }
-      STRING => pos = self.write_str(),
-      SIZED_STRING => pos = self.write_sized_str(),
+      STRING => pos = self.write_str()?,
+      SIZED_STRING => pos = self.write_sized_str()?,
       MPZ => {
-        let tag = self.file.read_u8().unwrap();
-        let sign_size = self.read_i64(tag) as i32;
+        let tag = self.file.read_u8()?;
+        let sign_size = self.read_i64(tag)? as i32;
         let capacity = sign_size.unsigned_abs();
+        if capacity == 0 {
+          return Err(DecompressError::Invalid("big number without limbs"))
+        }
         let size = (capacity as usize) << 3;
         if self.cfg.use_gmp {
           pos = self.write_header(tag::MPZ, ((capacity + 3) as u16) << 3, 0);
           self.write_u32(capacity);
           self.write_u32(sign_size as u32);
           self.write_u64(self.pos() + 8);
-          self.copy(size, size);
+          self.copy(size, size)?;
         } else {
           self.temp.resize(size, 0);
-          self.file.read_exact(&mut self.temp).unwrap();
+          self.file.read_exact(&mut self.temp)?;
           let mut size2 = size >> 2;
           if self.temp[size - 4..] == [0; 4] {
             size2 -= 1
@@ -2213,18 +2286,18 @@ impl<R: Read> LgzDecompressor<R> {
           _ => tag::PROMISE,
         };
         self.frames.push(Frame::Boxed(tag));
-        return Step::Read(LgzMode::Normal)
+        return Ok(Step::Read(LgzMode::Normal))
       }
-      EXPRISH => return Step::Read(LgzMode::Exprish),
-      tag @ ..=0xcf if tag & 15 == 0 => panic!("unknown opcode {tag:#x}"),
+      EXPRISH => return Ok(Step::Read(LgzMode::Exprish)),
+      ..=0xcf if tag & 15 == 0 => return Err(DecompressError::Invalid("unknown opcode")),
       tag @ ..=0xcf => {
         let ctor = tag >> 4;
         let (num_fields, sfields) = unpack_ctor(tag);
         return self.start_ctor(ctor, num_fields, sfields)
       }
       tag @ (UINT0..=UINT0_END | INT1 | INT2 | INT4 | INT8) =>
-        pos = ((self.read_i64(tag) << 1) | 1) as u64,
+        pos = ((self.read_i64(tag)? << 1) | 1) as u64,
     }
-    Step::Done(pos)
+    Ok(Step::Done(pos))
   }
 }

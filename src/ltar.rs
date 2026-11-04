@@ -29,6 +29,7 @@ pub enum UnpackError {
   NotEnoughPaths(u8),
   UnsupportedCompression(u8),
   MissingHash,
+  Lgz(lgz::DecompressError),
 }
 
 impl std::fmt::Display for UnpackError {
@@ -43,6 +44,7 @@ impl std::fmt::Display for UnpackError {
         f,
         "this .ltar was packed with -s (no depHash); an override hash must be supplied to unpack it"
       ),
+      UnpackError::Lgz(e) => e.fmt(f),
     }
   }
 }
@@ -573,7 +575,7 @@ fn unpack_one<R: BufRead>(
       let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, dict)?;
       #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
       let reader = zstd::stream::Decoder::new(reader)?;
-      let (buf, ranges) = lgz::decompress(reader, extra.len() + 1);
+      let (buf, ranges) = lgz::decompress(reader, extra.len() + 1).map_err(UnpackError::Lgz)?;
       for (r, path) in ranges.into_iter().zip([path].into_iter().chain(extra)) {
         let mut file = TempFile::new(path)?;
         file.write_all(&buf[r])?;
