@@ -5,17 +5,24 @@ use leangz::lgz::{decompress, DecompressError};
 use std::fs;
 use std::io::{Cursor, ErrorKind};
 
+const BYTE_ARRAY: u8 = 0x20;
 const STRING: u8 = 0x30;
+const SIZED_STRING: u8 = 0xb0;
 const MPZ: u8 = 0x40;
 const ARRAY: u8 = 0x00;
 const BIG_CTOR: u8 = 0x10;
 const EXPRISH: u8 = 0x80;
 const UINT0: u8 = 0xd0;
+const INT4: u8 = 0xfa;
+const INT8: u8 = 0xfb;
 const BACKREF0: u8 = 0xf0;
 const EXPRISH_NORMAL: u8 = 0x20;
 const EXPRISH_NAME_STR: u8 = 0x00;
 const EXPRISH_EXPR_BVAR: u8 = 0x07;
 const EXPRISH_EXPR_APP: u8 = 0x20;
+/// Object bases are multiples of 64 KiB.
+const BASE: u64 = 1 << 16;
+const TAG_MPZ: u8 = 250;
 
 /// An lgz stream of one .olean, with a version 2 header that claims `size`
 /// bytes, followed by `body`.
@@ -28,6 +35,25 @@ fn stream(size: u64, body: &[u8]) -> Vec<u8> {
   s.extend_from_slice(&[4, 34, 1, 0xff]); // Lean 4.34.1
   s.extend_from_slice(body);
   s
+}
+
+/// An object with a length `len` in the input, but no data after it.
+fn claims(len: i64) -> Vec<Vec<u8>> {
+  let int8 = |n: i64| [&[INT8][..], &n.to_le_bytes()].concat();
+  vec![
+    [&[ARRAY][..], &int8(len)].concat(),
+    [&[BYTE_ARRAY][..], &int8(len)].concat(),
+    [&[SIZED_STRING][..], &int8(len)].concat(),
+    // a big number of 2^31 - 1 limbs, 16 GiB
+    vec![MPZ, INT4, 0xff, 0xff, 0xff, 0x7f],
+  ]
+}
+
+fn ends_early(input: &[u8]) {
+  match decompress(Cursor::new(input), 1) {
+    Err(DecompressError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => {}
+    r => panic!("expected an early end, got {:?}", r.map(|_| ())),
+  }
 }
 
 fn invalid(input: &[u8]) -> &'static str {
@@ -115,4 +141,81 @@ fn test_wrong_field() {
   // an application of the number 1 to the number 2
   let app = [EXPRISH, EXPRISH_EXPR_APP + 1, UINT0 + 1, UINT0 + 2];
   assert_eq!(invalid(&stream(1 << 10, &app)), "expected an expression");
+}
+
+/// The decompressor checks the lengths in the input against the size of the
+/// output that the header gives, and its memory grows only as data arrives,
+/// so that a length cannot make it allocate more than the input fills.
+#[test]
+fn test_huge_lengths() {
+  // a header claiming more than any address space holds
+  assert!(decompress(Cursor::new(&stream(1 << 62, &[UINT0])), 1).is_ok());
+  for body in claims(1 << 58) {
+    assert_eq!(invalid(&stream(1 << 10, &body)), "larger than the size in the header");
+    ends_early(&stream(1 << 63, &body));
+  }
+  // a string longer than the 32 bytes that the header leaves after itself
+  let string = [&[STRING][..], &[b'a'; 40], &[0]].concat();
+  assert_eq!(invalid(&stream(128, &string)), "larger than the size in the header");
+  // thunks, each written once the object inside it is complete
+  let thunks = [vec![0x50; 1000], vec![UINT0]].concat();
+  assert_eq!(invalid(&stream(1 << 10, &thunks)), "larger than the size in the header");
+}
+
+/// A minimal version 2 `.olean` in the GMP layout, holding the objects that
+/// `objects` appends after the header; it returns the address of the root.
+fn olean(objects: impl FnOnce(&mut Vec<u8>) -> u64) -> Vec<u8> {
+  let mut buf = b"olean\x02\x01".to_vec(); // version 2, flags: GMP
+  let mut lean_version = [0u8; 33];
+  lean_version[..6].copy_from_slice(b"4.34.1");
+  buf.extend_from_slice(&lean_version);
+  buf.extend_from_slice(&[b'0'; 40]); // githash
+  buf.extend_from_slice(&BASE.to_le_bytes());
+  buf.extend_from_slice(&[0; 8]); // root
+  let root = objects(&mut buf);
+  buf[88..96].copy_from_slice(&root.to_le_bytes());
+  buf
+}
+
+/// Appends an object with tag `tag`, `num_fields` object fields and the 8-byte
+/// words `words` after its header, and returns its address.
+fn object(buf: &mut Vec<u8>, tag: u8, num_fields: u8, words: &[u64]) -> u64 {
+  let ptr = BASE + buf.len() as u64;
+  buf.extend_from_slice(&0u32.to_le_bytes()); // rc
+  buf.extend_from_slice(&(8 * (1 + words.len()) as u16).to_le_bytes());
+  buf.push(num_fields);
+  buf.push(tag);
+  words.iter().for_each(|w| buf.extend_from_slice(&w.to_le_bytes()));
+  ptr
+}
+
+/// Corrupting any byte of a valid stream gives an error or some output,
+/// never a panic or an abort.
+#[test]
+fn test_corrupted() {
+  let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/module");
+  // a negative big number: two limbs allocated, size -2, pointer to the limbs
+  let negative_mpz = olean(|buf| {
+    let ptr = BASE + buf.len() as u64;
+    object(buf, TAG_MPZ, 0, &[2 | (-2i32 as u32 as u64) << 32, ptr + 24, 5, 7])
+  });
+  // a constructor with the shape of `Expr.lit` whose field has no fields
+  let lit_shape = olean(|buf| {
+    let a = object(buf, 0, 0, &[1000000]);
+    object(buf, 9, 1, &[a, 7])
+  });
+  let small = fs::read(format!("{dir}/ScalarArray.olean")).unwrap();
+  for olean in [small, negative_mpz, lit_shape] {
+    let mut lgz = vec![];
+    leangz::lgz::compress(&[&olean], &mut lgz);
+    let (buf, ranges) = decompress(Cursor::new(&lgz), 1).unwrap();
+    assert!(buf[ranges[0].clone()] == olean[..], "the round trip changed the .olean");
+    for i in 0..lgz.len() {
+      for byte in [0, 0xff, lgz[i] ^ 1, lgz[i] ^ 0x80, lgz[i].wrapping_add(1)] {
+        let mut corrupt = lgz.clone();
+        corrupt[i] = byte;
+        let _ = decompress(Cursor::new(&corrupt), 1);
+      }
+    }
+  }
 }
