@@ -80,7 +80,7 @@ fn main() {
       let mut lgzfile = vec![];
       compressor.compress(mmaps, std::io::Cursor::new(&mut lgzfile));
       let (oleanfile, ranges) =
-        decompressor.decompress(std::io::Cursor::new(&lgzfile), mmaps.len());
+        decompressor.decompress(std::io::Cursor::new(&lgzfile), mmaps.len()).unwrap();
       let mut size = 0;
       for (&mmap, r) in mmaps.iter().zip(ranges) {
         size += r.len();
@@ -122,8 +122,11 @@ fn main() {
         println!("{file}");
       }
       let outfile = outfile.take().unwrap_or_else(|| format!("{file}.olean"));
-      let file = std::io::BufReader::new(File::open(file).unwrap());
-      let (buf, r) = decompressor.decompress(file, 1);
+      let reader = std::io::BufReader::new(File::open(&file).unwrap());
+      let (buf, r) = decompressor.decompress(reader, 1).unwrap_or_else(|e| {
+        eprintln!("{file}: {e}");
+        std::process::exit(1)
+      });
       let [r] = &*r else { unreachable!() };
       std::fs::write(outfile, &buf[r.clone()]).unwrap()
     }
@@ -216,7 +219,9 @@ impl Decompressor {
       dict: zstd::dict::DecoderDictionary::copy(ZSTD_DICT_V1),
     }
   }
-  fn decompress(&self, infile: impl BufRead, n: usize) -> (Vec<u8>, Vec<Range<usize>>) {
+  fn decompress(
+    &self, infile: impl BufRead, n: usize,
+  ) -> Result<(Vec<u8>, Vec<Range<usize>>), leangz::lgz::DecompressError> {
     #[cfg(feature = "flate2")]
     let infile = flate2::read::GzDecoder::new(infile);
     #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]

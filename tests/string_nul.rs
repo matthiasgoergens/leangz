@@ -131,7 +131,7 @@ impl OleanBuilder {
 fn roundtrip(olean: &[u8]) -> Vec<u8> {
   let mut compressed = vec![];
   leangz::lgz::compress(&[olean], &mut compressed);
-  let (buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1);
+  let (buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1).unwrap();
   assert_eq!(ranges.len(), 1);
   assert_eq!(olean, &buf[ranges[0].clone()]);
   compressed

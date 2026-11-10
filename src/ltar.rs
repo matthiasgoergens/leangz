@@ -29,6 +29,7 @@ pub enum UnpackError {
   NotEnoughPaths(u8),
   UnsupportedCompression(u8),
   MissingHash,
+  Lgz(lgz::DecompressError),
 }
 
 impl std::fmt::Display for UnpackError {
@@ -43,6 +44,7 @@ impl std::fmt::Display for UnpackError {
         f,
         "this .ltar was packed with -s (no depHash); an override hash must be supplied to unpack it"
       ),
+      UnpackError::Lgz(e) => e.fmt(f),
     }
   }
 }
@@ -424,7 +426,7 @@ pub fn unpack<R: BufRead + Seek>(
   let read_extra =
     |compression: u8, buf: &mut Vec<_>, tarfile: &mut R| -> Result<Vec<PathBuf>, UnpackError> {
       (0..if compression == COMPRESSION_LGZ_MODULE { 2 } else { 0 })
-        .map(|_| Ok(read_cstr_path(true, buf, tarfile)?.unwrap().unwrap()))
+        .map(|_| read_cstr_path(true, buf, tarfile)?.flatten().ok_or(UnpackError::BadLtar))
         .collect()
     };
   let trace_path =
@@ -524,6 +526,16 @@ pub fn unpack<R: BufRead + Seek>(
   }
 }
 
+/// Reads an entry's length and then its bytes into `buf`, which grows only as
+/// they arrive, so that a corrupt length cannot make it allocate more than
+/// the file holds.
+fn read_entry(tarfile: &mut impl BufRead, buf: &mut Vec<u8>) -> Result<(), UnpackError> {
+  let len = tarfile.read_u64::<LE>()?;
+  buf.clear();
+  lgz::read_into(tarfile, buf, len.try_into().map_err(|_| UnpackError::BadLtar)?)?;
+  Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn unpack_one<R: BufRead>(
   _version: LtarVersion, tarfile: &mut R, trace_override: Option<u64>, verbose: bool,
@@ -539,9 +551,7 @@ fn unpack_one<R: BufRead>(
   }
   match compression {
     COMPRESSION_ZSTD => {
-      buf.clear();
-      buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-      tarfile.read_exact(buf)?;
+      read_entry(tarfile, buf)?;
       let reader = std::io::Cursor::new(&**buf);
       #[cfg(feature = "zstd")]
       let reader = zstd::stream::Decoder::new(reader)?;
@@ -565,15 +575,13 @@ fn unpack_one<R: BufRead>(
       uncommitted.push(file.stage());
     }
     COMPRESSION_LGZ | COMPRESSION_LGZ_MODULE => {
-      buf.clear();
-      buf.resize(tarfile.read_u64::<LE>()? as usize, 0);
-      tarfile.read_exact(buf)?;
+      read_entry(tarfile, buf)?;
       let reader = std::io::Cursor::new(&**buf);
       #[cfg(all(feature = "zstd", feature = "zstd-dict"))]
       let reader = zstd::stream::Decoder::with_prepared_dictionary(reader, dict)?;
       #[cfg(all(feature = "zstd", not(feature = "zstd-dict")))]
       let reader = zstd::stream::Decoder::new(reader)?;
-      let (buf, ranges) = lgz::decompress(reader, extra.len() + 1);
+      let (buf, ranges) = lgz::decompress(reader, extra.len() + 1).map_err(UnpackError::Lgz)?;
       for (r, path) in ranges.into_iter().zip([path].into_iter().chain(extra)) {
         let mut file = TempFile::new(path)?;
         file.write_all(&buf[r])?;
@@ -676,7 +684,7 @@ fn skip_one<R: BufRead + Seek>(
     }
     compression => return Err(UnpackError::UnsupportedCompression(compression)),
   };
-  tarfile.seek_relative(len.try_into().unwrap())?;
+  tarfile.seek_relative(len.try_into().map_err(|_| UnpackError::BadLtar)?)?;
   Ok(())
 }
 

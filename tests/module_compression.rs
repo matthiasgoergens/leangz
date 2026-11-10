@@ -38,7 +38,7 @@ fn test_module_roundtrip() {
   );
 
   // Decompress
-  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 3);
+  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 3).unwrap();
 
   assert_eq!(ranges.len(), 3, "Expected 3 ranges for the 3 files");
 
@@ -99,7 +99,7 @@ fn test_single_olean_roundtrip() {
   println!("Compressed size: {} bytes", compressed.len());
 
   // Decompress
-  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1);
+  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1).unwrap();
 
   assert_eq!(ranges.len(), 1, "Expected 1 range for 1 file");
 
@@ -127,7 +127,7 @@ fn test_scalar_array_roundtrip() {
   let mut compressed = Vec::new();
   leangz::lgz::compress(&[&olean], &mut compressed);
 
-  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1);
+  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1).unwrap();
 
   assert_eq!(ranges.len(), 1, "Expected 1 range for 1 file");
 
@@ -151,7 +151,7 @@ fn test_wide_scalar_array_roundtrip() {
   let mut compressed = Vec::new();
   leangz::lgz::compress(&[&olean], &mut compressed);
 
-  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1);
+  let (decompressed_buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1).unwrap();
 
   assert_eq!(ranges.len(), 1, "Expected 1 range for 1 file");
 

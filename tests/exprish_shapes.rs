@@ -69,7 +69,7 @@ fn roundtrip(olean: Vec<u8>) {
   std::thread::spawn(move || {
     let mut compressed = vec![];
     leangz::lgz::compress(&[&olean], &mut compressed);
-    let (buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1);
+    let (buf, ranges) = leangz::lgz::decompress(Cursor::new(&compressed), 1).unwrap();
     let _ = tx.send(olean == buf[ranges[0].clone()]);
   });
   match rx.recv_timeout(Duration::from_secs(10)) {
